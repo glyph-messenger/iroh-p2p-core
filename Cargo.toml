@@ -1,0 +1,29 @@
+[package]
+name = "iroh-p2p-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Glyph & Rune Contributors"]
+description = "Core P2P identity, tickets, peerbook, and framing primitives built on iroh and QUIC"
+repository = "https://github.com/glyph-messenger/iroh-p2p-core"
+
+[dependencies]
+iroh = "1.2"
+iroh-base = { version = "1.2", features = ["key"] }
+tokio = { version = "1", features = ["sync", "io-util", "time", "macros"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+data-encoding = "2"
+parking_lot = "0.12"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
