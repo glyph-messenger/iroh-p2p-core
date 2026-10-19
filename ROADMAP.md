@@ -1,317 +1,199 @@
-# Roadmap / Идеи развития iroh-p2p-core
+# Roadmap / План развития iroh-p2p-core
 
-Идеи реализации, собранные на основе анализа использования библиотеки в
-[Glyph](https://github.com/glyph-messenger/glyph) и [Rune](https://github.com/glyph-messenger/rune).
-
----
-
-## Контекст
-
-Библиотека молодая (два коммита), adoption частичный:
-
-- **Rune** использует почти всё (`EndpointId`, `Identity`, `WireSignature`, `PeerBook`,
-  `ReplayFilter`, `framing`), но дублирует паттерн подписанных тикетов
-  (`rune-protocol/src/ticket.rs` — почти копия `SignedTicket<T>`) и повторяет
-  `sign_bytes/sign/verify` трижды в `rune-protocol/src/messages.rs`
-  (`JoinRequest`, `PeerAnnouncement`, `PeerLeave`).
-- **Glyph** использует только `EndpointId`, `ENDPOINT_ID_LEN`, `SIGNATURE_LEN`, `P2pError`,
-  а `Identity`, `ReplayFilter`, `PeerBook` копирует 1:1 в
-  `glyph-crypto/src/identity.rs`, `glyph-crypto/src/replay.rs`, `glyph-net/src/addr.rs`
-  (~600 строк дубликатов).
+Стратегический план развития библиотеки `iroh-p2p-core` на основе анализа реальной кодовой базы ядра и зависимых проектов [Glyph](https://github.com/glyph-messenger/glyph) (децентрализованный мессенджер) и [Rune](https://github.com/glyph-messenger/rune) (mesh VPN).
 
 ---
 
-## Приоритет 1 — устранение дублирования
+## 1. Контекст и статус интеграции
 
-### 1.1 Универсальный паттерн «подписанное сообщение»
+Библиотека `iroh-p2p-core` служит общим криптографическим и транспортным фундаментом для P2P-нод на базе `iroh`.
 
-Самый повторяющийся код в обоих проектах — `sign_bytes()` (bincode + domain separator),
-`sign()`, `verify()`. Предложить один из вариантов:
+### Текущий статус в проектах:
+- **Rune**:
+  - Использует: `EndpointId`, `Identity`, `WireSignature`, `PeerBook`, `ReplayFilter`, `framing`.
+  - Дублирует:
+    - Конверсии `ticket ↔ EndpointAddr` в `rune-net/src/addr.rs`.
+    - Тройной бойлерплейт `sign_bytes/sign/verify` в `rune-protocol/src/messages.rs` (`JoinRequest`, `PeerAnnouncement`, `PeerLeave`).
+    - Ручную генерацию nonce через зависимость `rand 0.8` в `rune-core/src/host.rs`.
+- **Glyph**:
+  - Использует: `EndpointId`, `ENDPOINT_ID_LEN`, `SIGNATURE_LEN`, `Identity`, `verify`, `ReplayFilter`, `PeerBook`.
+  - Дублирует / обходит:
+    - Собственный `SignedEnvelope` поверх **Cap'n Proto** (`glyph-protocol/src/codec.rs`).
+    - Генерацию nonce через хак с `uuid::Uuid::new_v4()` (`glyph-protocol/src/ids.rs`).
+    - Конверсии тикетов в `glyph-net/src/addr.rs`.
 
-**Вариант A — трейт:**
-
-```rust
-/// Тип, который умеет считать канонические байты для подписи.
-pub trait Signable {
-    fn sign_bytes(&self, domain: &'static [u8]) -> Vec<u8>;
-
-    fn sign_with(&mut self, identity: &Identity, domain: &'static [u8])
-    where Self: SetSignature,
-    {
-        let bytes = self.sign_bytes(domain);
-        self.set_signature(WireSignature(identity.sign(&bytes)));
-    }
-
-    fn verify_with(&self, signer: &EndpointId, domain: &'static [u8]) -> Result<()>
-    where Self: GetSignature,
-    {
-        let bytes = self.sign_bytes(domain);
-        verify(signer, &bytes, self.get_signature().as_bytes())
-    }
-}
-
-pub trait SetSignature { fn set_signature(&mut self, sig: WireSignature); }
-pub trait GetSignature { fn get_signature(&self) -> &WireSignature; }
-```
-
-**Вариант B — derive-макрос** (`iroh-p2p-core-derive`):
-
-```rust
-#[derive(Signed)]
-#[sign_domain = "rune-ctrl-v1"]
-struct JoinRequest {
-    client_endpoint: EndpointId,
-    // ... остальные поля
-    #[signature]
-    signature: WireSignature,
-}
-```
-
-Макрос генерирует `sign_bytes/sign/verify` автоматически, исключая поле с атрибутом
-`#[signature]` из подписываемых байт.
-
-**Эффект:** rune удаляет ~200 строк (`messages.rs`), glyph — свои
-`envelope_sign_bytes/ticket_sign_bytes` из `glyph-protocol/src/codec.rs`.
-
-- [ ] Выбрать вариант (трейт проще и без proc-macro; макрос удобнее)
-- [ ] Реализовать + юнит-тесты (tampering, domain separation)
-- [ ] Мигрировать rune `messages.rs` и glyph `codec.rs`
-
-### 1.2 `SignedEnvelope` в ядре
-
-У glyph есть готовый паттерн envelope: `version`, `timestamp_ms`, `nonce`, `sender`,
-`payload`, `signature` + `verify_envelope_with_replay` (`glyph-crypto/src/identity.rs`).
-Это общий примитив для P2P-приложений.
-
-```rust
-pub struct SignedEnvelope<P> {
-    pub version: u16,
-    pub timestamp_ms: u64,
-    pub nonce: [u8; 16],
-    pub sender: EndpointId,
-    pub payload: P,
-    pub signature: WireSignature,
-}
-
-impl<P> SignedEnvelope<P> {
-    pub fn sign(&mut self, identity: &Identity, domain: &'static [u8]);
-    pub fn verify(&self, domain: &'static [u8]) -> Result<()>;
-    pub fn verify_with_replay(&self, domain: &'static [u8], filter: &ReplayFilter) -> Result<()>;
-}
-```
-
-**Эффект:** glyph удаляет свой `replay.rs` и `verify_*`-хелперы, переиспользуя ядро.
-
-- [ ] Реализовать `SignedEnvelope` + `encode/decode` (bincode)
-- [ ] Мигрировать glyph: заменить `Envelope`-верификацию на ядерную
-
-### 1.3 Переход обоих проектов на `SignedTicket<T>`
-
-В ядре уже есть `from_endpoint_addr`/`to_endpoint_addr`, но rune пишет свои
-`ticket_to_endpoint_addr`/`endpoint_addr_to_ticket` в `rune-net/src/addr.rs`.
-Тикет-типы у проектов свои (`NetworkTicket`, `InviteTicket`), поэтому прямой переход
-невозможен без адаптера.
-
-**Идея:** вынести «адресную часть» тикета в общий тип в ядре:
-
-```rust
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TicketAddrInfo {
-    pub relay_url: Option<String>,
-    pub direct_addrs: Vec<SocketAddr>,
-}
-
-impl TicketAddrInfo {
-    pub fn from_endpoint_addr(addr: &EndpointAddr) -> Self;
-    pub fn to_endpoint_addr(&self, id: EndpointId) -> Result<EndpointAddr>;
-}
-```
-
-Проекты встраивают `TicketAddrInfo` в свои тикеты и получают конверсии бесплатно.
-
-**Эффект:** убирает дубликат в `rune-net/src/addr.rs` и `glyph-net/src/addr.rs`.
-
-- [ ] Добавить `TicketAddrInfo` в `ticket.rs`
-- [ ] Мигрировать rune `addr.rs`, glyph `addr.rs`
+> [!IMPORTANT]
+> **Различие сериализаторов:** Rune использует `bincode`, а Glyph — `capnp` (Cap'n Proto). Любые абстракции подписи и конвертов в ядре должны быть независимы от формата сериализации полезной нагрузки (работать со слайсами байт `&[u8]` или через generic writer).
 
 ---
 
-## Приоритет 2 — улучшение существующих модулей
+## 2. Поэтапный план релизов (Milestones)
 
-### 2.1 `ReplayFilter` (используется в rune-host и glyph-server)
-
-- [ ] **Per-sender фильтрация.** Сейчас nonce-пространство глобальное; для multi-user
-      сервера правильнее keyed по `EndpointId`:
-
-```rust
-pub struct SenderReplayFilter {
-    filters: RwLock<HashMap<EndpointId, ReplayFilter>>,
-}
-
-impl SenderReplayFilter {
-    pub fn check_and_record(&self, sender: EndpointId, ts_ms: u64, nonce: &[u8; 16]) -> Result<()>;
-}
-```
-
-- [ ] **Раздельные `check()` / `record()`** — сейчас только `check_and_record`,
-      нельзя «проверить всё, потом закоммитить» (важно для транзакционной логики host'а).
-- [ ] **Инъекция часов** (`now_fn: fn() -> u64` или `Instant`) для детерминированных тестов.
-- [ ] Экспорт `len()`, внешний `prune()`.
-- [ ] Использовать один тип ключа (сейчас `[u8; 16]` захардкожен в `P2pError::ReplayDetected`).
-
-### 2.2 `PeerBook`
-
-- [ ] **`last_seen`/TTL** — хранить `Instant`/timestamp обновления и уметь выселять
-      устаревшие записи (`evict_older_than`).
-- [ ] **Итераторы и снимки:** `iter()`, `snapshot() -> HashMap<EndpointId, EndpointAddr>`, `merge(&PeerBook)`.
-- [ ] **Serde-персистентность:** `save(&Path)` / `load(&Path)` для переживания рестартов.
-- [ ] **Оптимизация `update()`** — сейчас цепочка `existing.clone().with_*()` на каждый
-      адрес даёт O(n²) копирований; переписать на одну сборку.
-
-### 2.3 `Identity`
-
-- [ ] **`zeroize` секрета при drop** (сейчас ключ остаётся в памяти).
-- [ ] **Версия формата файла** (magic + version) вместо голых 32 байт — иначе будущее
-      изменение формата молча сломает старые ключи.
-- [ ] **`sign_struct(domain, &T) -> WireSignature`** — одно место для «подписать структуру»
-      вместо ручного bincode-оборачивания во всех проектах.
-- [ ] **`from_seed([u8; 32])`** для детерминированных тестов и интеграций.
-
-### 2.4 `framing`
-
-- [ ] **`FramedStream<T>`** — асинхронный поток сообщений (как tokio-serde, но на bincode):
-
-```rust
-pub struct FramedStream<S, T> { /* ... */ }
-impl<S: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned> FramedStream<S, T> {
-    pub async fn send(&mut self, msg: &T) -> Result<()>;
-    pub async fn recv(&mut self) -> Result<T>;
-}
-```
-
-- [ ] **Опциональный varint-длинник** — 4 байта на каждое мелкое контрольное сообщение
-      (у rune их много) — расточительно.
-- [ ] **`write_frame` без `flush`** (флаг/отдельная функция) для пакетной отправки.
-- [ ] Конфигурация через структуру (`FramingConfig { max_frame_size, varint, flush }`)
-      вместо раскиданных констант.
-
-### 2.5 `ticket`
-
-- [ ] **`expires_at` / `not_before`** и проверка возраста в `verify()`.
-- [ ] **`Display` / `FromStr`** для `SignedTicket<T>` (сейчас только `encode_base32`).
-- [ ] **Убрать `unwrap_or_default()` в `sign_bytes()`** — скрытая ошибка сериализации
-      сейчас превращается в подписывание пустых байт; возвращать `Result<Vec<u8>>`.
-
-### 2.6 `endpoint_id`
-
-- [ ] **Serde как hex-строка** для человекочитаемых форматов (сейчас в JSON — массив чисел):
-      `#[serde(with = "hex_serde")]` с сохранением бинарного вида для bincode.
-- [ ] `AsRef<[u8]>`, `Borrow<[u8]>` для совместимости с общими API.
-- [ ] Ускорение `to_hex()` (константный буфер вместо цикла с `write!`).
-
-### 2.7 `error`
-
-- [ ] Варианты: `RelayUrl`, `InvalidLength`, `Expired` — сейчас всё падает в `Other(String)`.
-- [ ] Рассмотреть `#[non_exhaustive]` для semver-гибкости.
-
----
-
-## Приоритет 3 — новые модули
-
-### 3.1 `nonce`
-
-Оба проекта страдают без нормального источника nonce:
-
-- glyph генерирует nonce хаком через `uuid::Uuid::new_v4()` (`glyph-protocol/src/ids.rs`)
-- rune тянет `rand` 0.8 только ради `thread_rng().fill_bytes()` (`rune-core/src/host.rs`)
-
-```rust
-pub const NONCE_LEN: usize = 16;
-pub fn random_nonce() -> [u8; NONCE_LEN];   // на getrandom
-```
-
-- [ ] Реализовать, заменить костыли в glyph и rune, убрать лишние зависимости.
-
-### 3.2 `time`
-
-`unix_now_ms()` есть отдельной копией в glyph (`glyph-protocol/src/types.rs`) и инлайном
-в rune (`rune-core/src/host.rs`).
-
-```rust
-pub fn unix_now_ms() -> u64;
-```
-
-### 3.3 `rate` — RateLimiter / token bucket
-
-Нужен glyph-server и rune-host для защиты от спама join/сообщений.
-
-```rust
-pub struct RateLimiter { /* token bucket */ }
-impl RateLimiter {
-    pub fn new(rate_per_sec: f64, burst: usize) -> Self;
-    pub fn try_acquire(&self, key: EndpointId) -> bool;   // keyed-вариант
-}
-```
-
-### 3.4 `backoff`
-
-Экспоненциальный backoff для переподключений — общая боль обоих проектов.
-
-### 3.5 `connect` — хелперы поверх iroh Endpoint
-
-- `connect_with_retry(endpoint, peer_book, id)` — попытки по всем известным адресам.
-- Keepalive / ping-pong с таймаутами (rune уже делает свой `Ping/Pong` вручную).
-
-### 3.6 `secrets` — X25519 + HKDF
-
-Для E2E-производных ключей (glyph key packages, rune при желании):
-
-```rust
-pub struct DhKeypair { /* x25519 */ }
-pub fn derive_symmetric(dh: SharedSecret, context: &str) -> [u8; 32]; // HKDF/blake3
+```mermaid
+flowchart TD
+    M1["v0.3.0: Быстрые победы, эргономика и безопасность"] --> M2["v0.4.0: Унификация сообщений и тикетов"]
+    M2 --> M3["v0.5.0: Модульность (Features) и стриминг"]
+    M3 --> M4["v1.0.0: CI, фаззинг и Crates.io"]
 ```
 
 ---
 
-## Приоритет 4 — инфраструктура
+### Milestone 1: v0.3.0 — Быстрые победы, эргономика и безопасность
 
-- [ ] **Feature flags.** Сейчас `EndpointId` в glyph тянет за собой весь `iroh`
-      (тяжёлая зависимость) ради одного типа. Разделить:
-      - `core` (по умолчанию): `endpoint_id`, `identity`, `signature`, `replay`, `framing` —
-        только `iroh-base`
-      - `iroh` (опционально): `ticket`, `peerbook` — полный `iroh`
-- [ ] **Публикация на crates.io** — убрать git-зависимости и `[patch]`-костыль из
-      `glyph/Cargo.toml`.
-- [ ] **CI**: в `.github` сейчас нет workflow. Добавить `cargo fmt/clippy/test` + проверку
-      всех feature-комбинаций.
-- [ ] **Fuzz-тесты** `decode_base32` на мусорных строках (защита от паник),
-      proptest для ticket roundtrip.
-- [ ] **Бенчмарки** (criterion) для framing и replay.
-- [ ] **Документация:** doc-примеры для каждого модуля, `#![deny(missing_docs)]`,
-      CHANGELOG.
+> **Цель:** закрыть базовые потребности зависимых проектов в мелких утилитах, устранить ненужные зависимости (`rand 0.8`), повысить безопасность памяти и производительность.
+
+#### 1.1 Модуль `nonce`
+- [ ] Добавить модуль `src/nonce.rs`:
+  ```rust
+  pub const NONCE_LEN: usize = 16;
+  pub fn random_nonce() -> [u8; NONCE_LEN];
+  ```
+- [ ] Реализовать на базе прямого `getrandom` (без тяжелого `rand`).
+- [ ] **Эффект:** Rune удаляет `rand 0.8` из `rune-core`, Glyph убирает хак с `uuid::new_v4()` в генерации nonce сообщений.
+
+#### 1.2 Модуль `time`
+- [ ] Добавить модуль `src/time.rs`:
+  ```rust
+  pub fn unix_now_ms() -> u64;
+  ```
+- [ ] **Эффект:** единый источник системного времени в миллисекундах для replay-фильтров и протокольных меток.
+
+#### 1.3 Улучшение `EndpointId`
+- [ ] **Serde-адаптер для форматов:**
+  - В human-readable форматах (JSON, TOML, YAML) сериализовать как hex-строку (`"a1b2..."`).
+  - В бинарных форматах (bincode, postcard) сохранять компактные 32 байта `[u8; 32]`.
+- [ ] Трейты: `AsRef<[u8; 32]>`, `Borrow<[u8; 32]>`, `AsRef<[u8]>`.
+- [ ] Оптимизация `to_hex()`: константный lookup-буфер вместо цикла с форматированием через `write!`.
+
+#### 1.4 Безопасность и тестирование `Identity`
+- [ ] **Zeroize при Drop:** очистка секретного ключа в памяти (`zeroize::ZeroizeOnDrop`).
+- [ ] Метод `Identity::from_seed([u8; 32])` для воспроизводимых тестов в обоих проектах.
+- [ ] Добавить версию/magic в формат файла сохранения ключа (с обратной совместимостью по размеру 32 байта для legacy-файлов).
+
+#### 1.5 Оптимизация `PeerBook`
+- [ ] Устранить O(N²) клонирований в `PeerBook::update()` при добавлении списка IP и relay.
+- [ ] Добавить методы `snapshot() -> HashMap<EndpointId, EndpointAddr>` и `len()`, `is_empty()`.
+
+#### 1.6 Статус `ticket`
+- [x] Распространение ошибок сериализации в `sign_bytes() -> Result<Vec<u8>>` *(выполнено в dcd379d)*.
+- [ ] Реализация `Display` и `FromStr` для `SignedTicket<T>`.
 
 ---
 
-## Известные проблемы в зависимых проектах
+### Milestone 2: v0.4.0 — Унификация подписанных сообщений и тикетов
 
-1. **Glyph `glyph-protocol/src/ids.rs` (строки 104–123)** реализует
-   `impl fmt::Debug/Display/FromStr for EndpointId` — чужой тип из крейта, это нарушение
-   orphan rule (E0117), код не скомпилируется. Ядро уже даёт `Display` (полный hex)
-   и `Debug` (короткий hex); для `FromStr -> ProtocolError` достаточно существующего
-   `#[from] P2pError` в `glyph-protocol/src/error.rs`. Мигрировать glyph на нативные
-   impl'ы ядра.
-2. **Rune `rune-net/src/addr.rs`** дублирует конверсии ticket ↔ `EndpointAddr` из ядра
-   (см. 1.3).
-3. **Rune `messages.rs`** — три копии `sign_bytes/sign/verify` (см. 1.1).
+> **Цель:** радикально сократить дублирование протокольного кода в Rune (`messages.rs`) и Glyph (`addr.rs`, `identity.rs`).
+
+#### 2.1 Паттерн «Подписанные структуры» (`Signable` / `Signed<T>`)
+- [ ] **Архитектурное решение:** поддержка как bincode (Rune), так и Cap'n Proto (Glyph).
+  
+  **Подход: Обобщенный трейт + обертка `Signed<T>`:**
+  ```rust
+  /// Трейт канонической сериализации для подписи
+  pub trait Signable {
+      fn write_canonical_payload<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()>;
+  }
+
+  /// Обертка полезной нагрузки с сигнатурой
+  #[derive(Clone, Debug, Serialize, Deserialize)]
+  pub struct Signed<T> {
+      pub payload: T,
+      pub signature: WireSignature,
+  }
+
+  impl<T: Signable> Signed<T> {
+      pub fn sign(payload: T, identity: &Identity, domain: &'static [u8]) -> Result<Self>;
+      pub fn verify(&self, signer: &EndpointId, domain: &'static [u8]) -> Result<()>;
+  }
+  ```
+- [ ] Набор тестов на защиту от подделки (tampering) и разделение доменов (domain separation).
+- [ ] Миграция `rune-protocol/src/messages.rs` (удаление ~200 строк бойлерплейта).
+
+#### 2.2 `TicketAddrInfo`
+- [ ] Выделить сетевую часть тикета в отдельный тип:
+  ```rust
+  #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+  pub struct TicketAddrInfo {
+      pub relay_url: Option<String>,
+      pub direct_addrs: Vec<SocketAddr>,
+  }
+
+  impl TicketAddrInfo {
+      pub fn from_endpoint_addr(addr: &EndpointAddr) -> Self;
+      pub fn to_endpoint_addr(&self, id: EndpointId) -> Result<EndpointAddr>;
+  }
+  ```
+- [ ] Интегрировать `TicketAddrInfo` в `SignedTicket<T>`.
+- [ ] Мигрировать `rune-net/src/addr.rs` и `glyph-net/src/addr.rs` на общий конвертер.
+
+#### 2.3 `ReplayFilter` v2 (Multi-Peer / Multi-User)
+- [ ] **`SenderReplayFilter` / `PeerReplayFilter`:**
+  - Шардирование фильтров по `EndpointId` (защита от того, чтобы один шумный пир вытеснял nonce других пиров из общего буфера).
+- [ ] **Двухфазная валидация:** раздельные методы `check(ts, nonce)` и `record(ts, nonce)` для атомарных проверок перед применением состояния.
+- [ ] Возможность внедрения функции времени (`now_fn: fn() -> u64`) для детерминированных тестов.
+- [ ] Метод явной очистки устаревших записей `prune()`.
 
 ---
 
-## Предлагаемый порядок работы
+### Milestone 3: v0.5.0 — Модульность (Feature Flags) и I/O
 
-1. 1.1 + 1.2 (derive/трейт подписанных сообщений + `SignedEnvelope`) — максимальный
-   эффект, сокращает оба проекта на сотни строк.
-2. 2.1 (`ReplayFilter`: per-sender + check/record split) — нужно обоим серверам.
-3. 2.2 + 2.3 (`PeerBook` TTL, `Identity` zeroize/версия формата).
-4. 3.1–3.2 (nonce/time) — быстрые победы, убирают костыли и зависимости.
-5. 1.3 (`TicketAddrInfo`) и миграция тикетов.
-6. 4.x (feature flags, crates.io, CI).
+> **Цель:** облегчить зависимости ядра, добавить потоковый фрейминг и управление жизненным циклом пиров.
+
+#### 3.1 Расщепление на Feature Flags
+Сейчас `iroh-p2p-core` тащит тяжелый крейт `iroh` (с QUIC-стеком, rustls и tokio) даже для чисто криптографических модулей.
+- [ ] Выделить фичи в `Cargo.toml`:
+  - `default = ["iroh"]`
+  - `core` (минимальный): `endpoint_id`, `identity`, `signature`, `replay`, `time`, `nonce` — только `iroh-base` (быстрая сборка, нет сетевого стека).
+  - `framing`: модуль `framing` (зависит от `tokio/io-util`).
+  - `iroh`: модули `peerbook` и интеграция `EndpointAddr` в `ticket` (зависит от полного `iroh`).
+
+#### 3.2 `FramedStream<T>` и конфигурация фрейминга
+- [ ] Структура конфигурации `FramingConfig`:
+  ```rust
+  pub struct FramingConfig {
+      pub max_frame_size: usize,
+      pub flush_immediately: bool,
+  }
+  ```
+- [ ] Асинхронный кодек-обертка `FramedStream<S, T>` над `AsyncRead + AsyncWrite`.
+- [ ] Опциональная поддержка varint-длин для экономии байт на частых мелких управляющих сообщениях (Ping/Pong в Rune).
+
+#### 3.3 PeerBook TTL & Eviction
+- [ ] Хранение времени последнего обновления записи пира (`last_seen`).
+- [ ] Метод выселения устаревших пиров `evict_older_than(Duration)`.
+- [ ] Serde-сериализация каталога (`save(&Path)` / `load(&Path)`) для сохранения состояния при перезапуске демонов.
+
+#### 3.4 Вспомогательные сетевые примитивы
+- [ ] **Rate Limiting (`rate`)**: потокобезопасный Token Bucket с привязкой к `EndpointId` (защита от спама запросов присоединения).
+- [ ] **Backoff (`backoff`)**: экспоненциальный backoff с джиттером для P2P-переподключений.
+
+---
+
+### Milestone 4: v1.0.0 — Инфраструктура качества и Crates.io
+
+> **Цель:** стабилизация API, публикация на crates.io, исключение git-зависимостей в экосистеме.
+
+- [ ] **CI (GitHub Actions):**
+  - Матрица тестов Linux / macOS / Windows.
+  - Проверка всех комбинаций feature-флагов (`--no-default-features`, `--all-features`).
+  - `cargo fmt --check`, `cargo clippy -- -D warnings`.
+- [ ] **Фаззинг и Proptest:**
+  - Proptest для тикетов (roundtrip `SignedTicket ↔ Base32`).
+  - Фаззинг парсера Base32 и фрейминга на поврежденных и злонамеренных входных данных.
+- [ ] **Бенчмарки:**
+  - Измерение пропускной способности `framing` и задержки `ReplayFilter::check_and_record` под многопоточной нагрузкой.
+- [ ] **Документация и релиз:**
+  - Включение `#![warn(missing_docs)]` на всех публичных API.
+  - Описание архитектуры в `README.md` с примерами интеграции.
+  - Публикация первой стабильной версии на [crates.io](https://crates.io).
+
+---
+
+## 3. Рекомендуемый порядок выполнения ближайших задач
+
+1. **`src/nonce.rs` + `src/time.rs`** — изолированные функции с мгновенной пользой для обоих проектов.
+2. **`EndpointId` serde & ergonomics** — hex в JSON, поддержка AsRef/Borrow, оптимизация `to_hex`.
+3. **`Identity::from_seed` и `zeroize`** — безопасность и удобство тестов.
+4. **`Signable` / `Signed<T>`** — решение проблемы дублирования в `rune-protocol` и `glyph-protocol`.
+5. **`TicketAddrInfo`** — унификация конверсий адресов тикетов.
+6. **Feature flags в `Cargo.toml`** — разделение `core` и полного `iroh`.
