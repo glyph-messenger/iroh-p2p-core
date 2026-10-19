@@ -45,7 +45,7 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SignedTicket<T> {
         addr: &EndpointAddr,
         payload: T,
         created_at_ms: u64,
-    ) -> Self {
+    ) -> Result<Self> {
         let relay_url = addr.relay_urls().next().map(|u| u.to_string());
         let direct_addrs: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
         let mut ticket = Self::new_unsigned(
@@ -55,12 +55,12 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SignedTicket<T> {
             created_at_ms,
             payload,
         );
-        ticket.sign(identity);
-        ticket
+        ticket.sign(identity)?;
+        Ok(ticket)
     }
 
     /// Canonical sign bytes including domain separator.
-    pub fn sign_bytes(&self) -> Vec<u8> {
+    pub fn sign_bytes(&self) -> Result<Vec<u8>> {
         #[derive(Serialize)]
         struct Payload<'a, P> {
             domain: &'static [u8],
@@ -80,18 +80,19 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SignedTicket<T> {
             payload: &self.payload,
         };
 
-        bincode::serialize(&wrapper).unwrap_or_default()
+        Ok(bincode::serialize(&wrapper)?)
     }
 
     /// Sign the ticket using the creator's Identity.
-    pub fn sign(&mut self, identity: &Identity) {
-        let bytes = self.sign_bytes();
+    pub fn sign(&mut self, identity: &Identity) -> Result<()> {
+        let bytes = self.sign_bytes()?;
         self.signature = WireSignature(identity.sign(&bytes));
+        Ok(())
     }
 
     /// Cryptographically verify ticket signature against the embedded endpoint_id.
     pub fn verify(&self) -> Result<()> {
-        let bytes = self.sign_bytes();
+        let bytes = self.sign_bytes()?;
         verify(&self.endpoint_id, &bytes, self.signature.as_bytes())
     }
 
@@ -162,7 +163,7 @@ mod tests {
             1700000000000,
             payload.clone(),
         );
-        ticket.sign(&id);
+        ticket.sign(&id).unwrap();
         assert!(ticket.verify().is_ok());
 
         let prefix = "demo:v1:";
@@ -184,7 +185,7 @@ mod tests {
             1700000000000,
             "secret-room".to_string(),
         );
-        ticket.sign(&id);
+        ticket.sign(&id).unwrap();
 
         let mut tampered = ticket.clone();
         tampered.payload = "evil-room".to_string();
