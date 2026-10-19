@@ -43,13 +43,23 @@ impl EndpointId {
     }
 
     pub fn short_hex(&self) -> String {
-        self.fmt_short(4)
+        self.fmt_short_len(4)
     }
 
-    pub fn fmt_short(&self, chars_per_side: usize) -> String {
+    pub fn fmt_short(&self) -> String {
+        self.short_hex()
+    }
+
+    pub fn fmt_short_len(&self, chars_per_side: usize) -> String {
         let full = self.to_hex();
         let n = chars_per_side.clamp(2, 16);
         format!("{}...{}", &full[0..n], &full[full.len() - n..])
+    }
+
+    pub fn hex_prefix(&self, bytes_count: usize) -> String {
+        let full = self.to_hex();
+        let n = (bytes_count * 2).min(full.len());
+        full[..n].to_string()
     }
 
     pub fn to_iroh_pubkey(&self) -> Result<PublicKey> {

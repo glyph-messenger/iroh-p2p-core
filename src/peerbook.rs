@@ -68,6 +68,22 @@ impl PeerBook {
         Ok(())
     }
 
+    /// Update peer addresses from raw relay URL string and slice of string addresses.
+    pub fn update_raw_strings(
+        &self,
+        peer: EndpointId,
+        relay_url: Option<&str>,
+        addrs: &[impl AsRef<str>],
+    ) -> Result<()> {
+        let mut direct = Vec::with_capacity(addrs.len());
+        for s in addrs {
+            if let Ok(sock) = s.as_ref().parse::<SocketAddr>() {
+                direct.push(sock);
+            }
+        }
+        self.update_raw(peer, relay_url, &direct)
+    }
+
     /// Add a direct IP socket address to the peer's record.
     pub fn add_ip(&self, peer: EndpointId, ip: SocketAddr) {
         if let Ok(pubkey) = peer.to_iroh_pubkey() {

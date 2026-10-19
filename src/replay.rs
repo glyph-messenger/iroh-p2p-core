@@ -5,8 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{P2pError, Result};
 
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000; // 5 minutes
-pub const DEFAULT_MAX_PAST_AGE_MS: u64 = 15 * 60 * 1000; // 15 minutes
-pub const DEFAULT_CAPACITY: usize = 20_000;
+pub const DEFAULT_MAX_PAST_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days for offline/queued messages
+pub const DEFAULT_MAX_CLOCK_SKEW_MS: u64 = DEFAULT_MAX_FUTURE_SKEW_MS;
+pub const DEFAULT_CAPACITY: usize = 50_000;
 
 /// Thread-safe filter protecting control and signaling messages against replay attacks.
 #[derive(Debug)]
@@ -36,6 +37,11 @@ impl Default for ReplayFilter {
 impl ReplayFilter {
     pub fn new(max_past_age_ms: u64, capacity: usize) -> Self {
         Self::with_past_and_future(max_past_age_ms, DEFAULT_MAX_FUTURE_SKEW_MS, capacity)
+    }
+
+    /// Creates a strict filter where past and future skew limits are identical (e.g. for real-time signaling).
+    pub fn new_strict(max_skew_ms: u64, capacity: usize) -> Self {
+        Self::with_past_and_future(max_skew_ms, max_skew_ms, capacity)
     }
 
     pub fn with_past_and_future(

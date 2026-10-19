@@ -21,7 +21,8 @@ pub use framing::{
 pub use identity::{Identity, verify};
 pub use peerbook::PeerBook;
 pub use replay::{
-    DEFAULT_CAPACITY, DEFAULT_MAX_FUTURE_SKEW_MS, DEFAULT_MAX_PAST_AGE_MS, ReplayFilter,
+    DEFAULT_CAPACITY, DEFAULT_MAX_CLOCK_SKEW_MS, DEFAULT_MAX_FUTURE_SKEW_MS,
+    DEFAULT_MAX_PAST_AGE_MS, ReplayFilter,
 };
 pub use signature::{SIGNATURE_LEN, WireSignature};
 pub use ticket::{SignedTicket, TICKET_SIGN_DOMAIN};
