@@ -13,6 +13,12 @@ pub enum P2pError {
     #[error("replay detected for nonce {0:?}")]
     ReplayDetected([u8; 16]),
 
+    #[error("replay filter capacity exceeded ({capacity}); active nonces cannot be pruned")]
+    ReplayFilterFull { capacity: usize },
+
+    #[error("peerbook capacity exceeded (max {0} peers)")]
+    PeerBookFull(usize),
+
     #[error("timestamp skew exceeded: timestamp={timestamp_ms}ms, local_now={now_ms}ms")]
     TimestampSkew { timestamp_ms: u64, now_ms: u64 },
 
