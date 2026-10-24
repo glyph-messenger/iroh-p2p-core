@@ -1,4 +1,5 @@
 use iroh_base::{PublicKey, SecretKey, Signature};
+use std::io::Write;
 use std::path::Path;
 
 use crate::endpoint_id::EndpointId;
@@ -28,17 +29,47 @@ impl Identity {
         }
     }
 
-    /// Load identity from file or create a newly generated one and save it.
+    /// Load identity from file or atomically create a newly generated one.
+    ///
+    /// This method is race-condition safe: if multiple concurrent processes or threads
+    /// attempt to initialize the file simultaneously, exactly one will create it, and all
+    /// others will safely load the newly created identity.
     pub fn load_or_create(path: &Path) -> Result<Self> {
-        if path.exists() {
-            Self::load(path)
-        } else {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let id = Self::generate();
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+        }
+
+        match open_opts.open(path) {
+            Ok(mut file) => {
+                file.write_all(&id.secret.to_bytes())?;
+                file.sync_all()?;
+                drop(file);
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = std::fs::metadata(path)?.permissions();
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(path, perms);
+                }
+
+                Ok(id)
             }
-            let id = Self::generate();
-            id.save(path)?;
-            Ok(id)
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // File already created concurrently or prior to this call: load it
+                Self::load(path)
+            }
+            Err(e) => Err(P2pError::Io(e)),
         }
     }
 
@@ -56,19 +87,55 @@ impl Identity {
         Ok(Self::from_bytes(&key))
     }
 
-    /// Save identity key to disk, setting 0600 file permissions on Unix.
+    /// Save identity key to disk atomically via temporary file and rename.
+    ///
+    /// On Unix, permissions are set to 0600 upon creation to prevent permissions race windows.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, self.secret.to_bytes())?;
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let counter = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file_stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("secret");
+        let tmp_path = parent.join(format!(".{file_stem}.{pid}.{nanos}.{counter}.tmp"));
+
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+        }
+
+        let mut file = open_opts.open(&tmp_path)?;
+        file.write_all(&self.secret.to_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path)?.permissions();
+            let mut perms = std::fs::metadata(&tmp_path)?.permissions();
             perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
+            let _ = std::fs::set_permissions(&tmp_path, perms);
         }
+
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            P2pError::Io(e)
+        })?;
+
         Ok(())
     }
 
@@ -126,6 +193,32 @@ mod tests {
 
         let id2 = Identity::load(&tmp).unwrap();
         assert_eq!(id1.endpoint_id(), id2.endpoint_id());
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn test_identity_load_or_create_concurrent_race_safe() {
+        let tmp =
+            std::env::temp_dir().join(format!("p2p-test-concurrent-id-{}", rand::random::<u64>()));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let path = tmp.clone();
+            handles.push(std::thread::spawn(move || {
+                Identity::load_or_create(&path).unwrap()
+            }));
+        }
+
+        let mut results = vec![];
+        for h in handles {
+            results.push(h.join().unwrap());
+        }
+
+        let first = results[0].endpoint_id();
+        for r in &results {
+            assert_eq!(r.endpoint_id(), first);
+        }
+
         let _ = std::fs::remove_file(tmp);
     }
 }
