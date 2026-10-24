@@ -88,9 +88,9 @@ impl FromStr for EndpointId {
 
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
-        if s.len() != ENDPOINT_ID_LEN * 2 {
+        if s.len() != ENDPOINT_ID_LEN * 2 || !s.is_ascii() {
             return Err(P2pError::PublicKey(format!(
-                "expected hex length {}, got {}",
+                "expected {} ASCII hex characters, got byte length {}",
                 ENDPOINT_ID_LEN * 2,
                 s.len()
             )));
@@ -147,5 +147,14 @@ mod tests {
     fn test_endpoint_id_short_hex() {
         let id = EndpointId([0xab; 32]);
         assert_eq!(id.short_hex(), "abab...abab");
+    }
+
+    #[test]
+    fn test_endpoint_id_non_ascii_multibyte_no_panic() {
+        // "€" is 3 bytes (0xE2, 0x82, 0xAC). Total byte length is 3 + 61 = 64 bytes.
+        let hostile = format!("€{}", "a".repeat(61));
+        assert_eq!(hostile.len(), 64);
+        let res: Result<EndpointId> = hostile.parse();
+        assert!(matches!(res, Err(P2pError::PublicKey(_))));
     }
 }
