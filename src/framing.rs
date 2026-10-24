@@ -6,6 +6,18 @@ use crate::error::{P2pError, Result};
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Read a length-prefixed frame (4-byte big endian length followed by payload) from an async stream.
+///
+/// # Cancellation Safety & Stream Contract
+///
+/// **WARNING:** This function is **NOT** cancellation-safe.
+/// If the returned future is dropped before completion (for example, by losing a `tokio::select!`
+/// race, timing out via `tokio::time::timeout`, or being cancelled by a task abort), any bytes
+/// already consumed by `read_exact` cannot be returned to the stream. Subsequent calls to
+/// `read_frame` on the same reader will read unaligned payload bytes as a new length prefix,
+/// irreparably desynchronizing the protocol framing.
+///
+/// **Contract:** If an invocation of `read_frame` is cancelled or fails with an error, the caller
+/// **MUST** drop and close the underlying transport stream.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R, max_size: usize) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
@@ -24,8 +36,37 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R, max_size: usize) -
 }
 
 /// Write a length-prefixed frame (4-byte big endian length followed by payload) into an async stream.
+///
+/// # Cancellation Safety
+///
+/// **WARNING:** This function is **NOT** cancellation-safe. If cancelled mid-write, a partial frame
+/// may remain in the write buffer or wire. The stream MUST be discarded upon cancellation or error.
+///
+/// # Errors
+///
+/// Returns `P2pError::FrameTooLarge` if `data.len()` exceeds `u32::MAX` or `DEFAULT_MAX_FRAME_SIZE`.
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
-    let len = data.len() as u32;
+    write_frame_bounded(writer, data, DEFAULT_MAX_FRAME_SIZE).await
+}
+
+/// Write a length-prefixed frame with a custom maximum frame size limit.
+pub async fn write_frame_bounded<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    max_size: usize,
+) -> Result<()> {
+    if data.len() > max_size {
+        return Err(P2pError::FrameTooLarge {
+            size: data.len(),
+            max: max_size,
+        });
+    }
+
+    let len = u32::try_from(data.len()).map_err(|_| P2pError::FrameTooLarge {
+        size: data.len(),
+        max: u32::MAX as usize,
+    })?;
+
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(data).await?;
     writer.flush().await?;
@@ -33,6 +74,8 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> 
 }
 
 /// Read and deserialize a bincode-encoded message from a length-prefixed stream.
+///
+/// Follows the same cancellation-safety contract as [`read_frame`].
 pub async fn read_bincode_msg<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(
     reader: &mut R,
     max_size: usize,
@@ -89,13 +132,24 @@ mod tests {
 
         let large_payload = vec![0u8; 1024];
         let write_task = tokio::spawn(async move {
-            let _ = write_frame(&mut client, &large_payload).await;
+            let _ = write_frame_bounded(&mut client, &large_payload, 2048).await;
         });
 
-        // Set max_size to 512 so it exceeds limit
+        // Set max_size to 512 so receiver rejects it
         let res = read_frame(&mut server, 512).await;
         assert!(matches!(res, Err(P2pError::FrameTooLarge { .. })));
 
         let _ = write_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_write_frame_rejects_oversized_before_sending() {
+        let (mut client, _server) = tokio::io::duplex(1024);
+        let payload = vec![0u8; 100];
+        let res = write_frame_bounded(&mut client, &payload, 50).await;
+        assert!(matches!(
+            res,
+            Err(P2pError::FrameTooLarge { size: 100, max: 50 })
+        ));
     }
 }
