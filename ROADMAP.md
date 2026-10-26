@@ -1,6 +1,6 @@
 # Roadmap / План развития iroh-p2p-core
 
-Стратегический план развития библиотеки `iroh-p2p-core` на основе анализа реальной кодовой базы ядра и зависимых проектов [Glyph](https://github.com/glyph-messenger/glyph) (децентрализованный мессенджер) и [Rune](https://github.com/glyph-messenger/rune) (mesh VPN).
+Стратегический план развития библиотеки `iroh-p2p-core` на основе анализа реальной кодовой базы ядра и зависимых проектов [Glyph](https://github.com/glyph-platform/glyph-messenger) (децентрализованный мессенджер) и [Rune](https://github.com/glyph-platform/rune) (mesh VPN).
 
 ---
 

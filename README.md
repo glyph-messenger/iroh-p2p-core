@@ -2,7 +2,7 @@
 
 Shared foundational primitives for decentralized peer-to-peer (P2P) systems built on **iroh** and **QUIC**.
 
-Used across the [Glyph](https://github.com/glyph-messenger/glyph) ecosystem (decentralized messenger) and [Rune](https://github.com/glyph-messenger/rune) (mesh VPN).
+Used across the [Glyph](https://github.com/glyph-platform/glyph-messenger) ecosystem (decentralized messenger) and [Rune](https://github.com/glyph-platform/rune) (mesh VPN).
 
 ---
 
